@@ -1,110 +1,51 @@
-# Temporal Generalization: A Reality Check — scaled reproduction + an original method (ATD)
+# Temporal Generalization: A Reality Check — a reproduction, and an idea of my own
 
-A small, honest reproduction of **Madaan, Chopra, Cho — *Temporal Generalization: A Reality Check* (ICLR 2026, [arXiv:2509.23487](https://arxiv.org/abs/2509.23487); official code [divyam3897/TG](https://github.com/divyam3897/TG))**, scaled to run on a laptop, plus one curiosity-driven extension: **per-layer, norm-aware downscaling**.
+This is my reproduction of Madaan, Chopra & Cho, *Temporal Generalization: A Reality Check* ([ICLR 2026](https://arxiv.org/abs/2509.23487), official code [divyam3897/TG](https://github.com/divyam3897/TG)), scaled down to run on a laptop. I started it because the paper's result surprised me and I wanted to see it fail for myself. Along the way I added a method of my own and two diagnostics that measure *why* the failure happens, rather than taking the explanation on faith.
 
-The paper's central claim: given only past model checkpoints and *no access to the future*, none of the popular "predict the future model" methods — model averaging/merging, EMA, or Taylor-series parameter extrapolation — consistently beats the trivial baseline of deploying the **most recent** model. The only method that reliably avoids degradation is **downscaling** (shrinking recent parameters toward zero), and even that helps for language modeling but not for vision. This repo reproduces that pattern and probes the "why."
+The question the paper asks is a tempting one: models rot as the world drifts, and retraining is expensive, so — given a history of past checkpoints and no access to the future — can you compute a model that will hold up on data you haven't seen yet? It tries the obvious tricks (average past checkpoints, shrink the latest one, extrapolate the trajectory forward) under one strict rule that a lot of prior work quietly breaks: you're not allowed to peek at the future, not even to tune a hyperparameter. Under that rule, none of the tricks reliably beat just deploying the most recent model.
 
-## Headline result (Yearbook, 3 seeds)
+## What I found
 
 ![forward transfer results](assets/forward_transfer.png)
 
-Reproduced cleanly: **no method reliably beats simply deploying the most recent model.** `taylor` edges ahead by 1.5 points, but that gap sits *inside* a 15-point standard deviation — the "apparent improvement that isn't" the paper warns about.
+The headline reproduced cleanly: on Yearbook, across three seeds, nothing beat the most-recent-model baseline. One method (Taylor extrapolation) edged ahead by about a point and a half, but that gap sits comfortably inside a fifteen-point standard deviation, so it's noise — which is exactly the kind of mirage the paper is warning people about.
 
-Two findings I care about most, because they test the paper's *explanations* for why these methods fail — and on Yearbook neither holds:
+The part I didn't expect: the two explanations the paper gives for *why* these methods fail don't actually hold on Yearbook.
 
-- **The loss basins are connected** (barrier ≈ 0.003). The paper blames disconnected basins; here they're connected and the methods still fail.
-- **The overconfidence story isn't supported** (α-vs-norm correlation r = +0.15, wrong sign for the "shrink because norms grow" hypothesis).
+- The loss barrier between consecutive checkpoints is essentially flat (≈ 0.003), so the checkpoints sit in connected regions of the loss surface, not the disconnected "basins" the paper points to — yet the methods still fail. (`results/fig_barriers.png`)
+- The correlation the "parameters grow overconfident, so shrinking helps" story predicts should be negative came out mildly positive (r ≈ +0.15). (`results/fig_alpha_norm.png`)
 
-So the methods fail even though neither intuitive explanation applies — which strengthens the paper's deepest point: without assumptions about how data evolves, the future is arbitrary. My original method **ATD** (shrink only along the recent-change subspace) also does not beat the baseline — an honest, informative negative result. Full write-up in `ONE_PAGER.md` / `FINDINGS.md`.
+So the methods fail even though neither intuitive reason applies here. To me that actually makes the paper's deeper point land harder: without some assumption about how the data changes over time, the future can be arbitrary, and no amount of clever averaging of past weights recovers it.
 
+## The idea I tried (ATD)
 
-## What this repo does
+The paper's downscaling shrinks the whole model toward zero, on the theory that it's grown overconfident about the present. My hunch was that the overconfidence isn't spread evenly — it should live in the few directions the model has *most recently* moved in, as it adapted to the latest data. So I tried shrinking the model only along that "recency subspace" (the top few principal directions of the recent parameter updates, found with an SVD) and leaving the rest of the model alone. I call it Anisotropic Trajectory Downscaling.
 
-- Builds a **checkpoint trajectory** by sequential fine-tuning (continual learning): the model at time *t* is initialized from θ_{t−1} and fine-tuned on the current timestep only (paper Eq. 5).
-- Implements every method — `recent`, `average`, `ema`, `downscale`, `taylor` (extrapolation), the extension `per_layer_downscale`, and an **original method `aniso_downscale` (ATD)** — as pure operations on past parameter vectors (`src/tg/methods.py`).
-- Runs across **multiple seeds** and reports **mean ± std** with error bars (the paper is a skepticism paper — single-run numbers would undercut it).
-- Evaluates **δ-forward transfer**: for each time *t* and horizon δ, estimate θ̃_{t+δ} from past checkpoints and score it on genuinely future data.
-- Tunes the α hyperparameters using **past/current data only**, by simulating a one-step-back deployment (paper Eq. 6). This is enforced in code — the tuner is structurally unable to see future data. *This is the whole point of the paper.*
-- Produces the key figures: forward-transfer curves, parameter-norm-vs-time, per-layer norm growth, and a PCA of the parameter trajectory.
-- Runs a **basin-barrier diagnostic** (`src/tg/analysis.py`): the loss along the straight line between consecutive checkpoints. This *measures* the mechanism the paper only asserts — whether checkpoints sit in connected or disconnected loss basins.
+It's a bit different from everything in the paper: it isn't a blend of checkpoints, it's a targeted rescaling of one subspace. On Yearbook it didn't beat the baseline either — but that's a useful thing to know, because it says the vision failure isn't a tidy low-dimensional "recent-direction" problem you can undo with a targeted shrink. The math and the two limiting cases (β = 1 is just the recent model; shrinking every direction is ordinary downscaling) are pinned down by unit tests in `tests/test_methods.py`.
 
-## Quick start
+## Running it
 
 ```bash
 pip install -r requirements.txt
 
-# 1) Sanity check the whole pipeline (<1 min, no download, runs anywhere):
+# quick check that everything works (under a minute, no download):
 python run.py --smoke-test
 
-# 2) Full synthetic run, 3 seeds with error bars (self-contained benchmark):
+# the self-contained synthetic benchmark, 3 seeds:
 python run.py --dataset synthetic --T 8 --epochs 3 --seeds 0 1 2
 
-# 3) Real Yearbook reproduction on your Mac (downloads Wilds-Time on first run):
+# the real Yearbook reproduction (downloads the Wild-Time data the first time):
 pip install wild-time-data
-python run.py --dataset yearbook --epochs 5 --device mps --seeds 0 1 2 --max-steps 12
+python run.py --dataset yearbook --epochs 5 --device mps --seeds 0 1 2
 ```
 
-Outputs land in `results/`: `forward_transfer.csv` (per seed/t/δ), `summary_by_method.csv` (mean ± std), `basin_barriers.csv`, `layer_growth.json`, `run_meta.json` (config/versions/git/timing), and figures — forward-transfer with error bars, norm trajectory, per-layer growth, PCA, α-vs-norm scatter, and the two basin-barrier plots. The console prints a per-method mean ± std table, the "does any method reliably beat Recent?" verdict, the α-vs-norm correlation, and the mean basin barrier.
+Each run drops its numbers and plots into `results/` — a per-method mean ± std table, the forward-transfer chart with error bars, the basin-barrier plots, the α-vs-norm scatter, and a `run_meta.json` recording the exact config, versions, and timing. There's also a small torch-free script (`tools/verify_logic_numpy.py`) that re-checks the whole pipeline's logic without needing a GPU, and unit tests you can run with `pytest -q`.
 
-Unit tests (method math + convex-hull / direction-preservation guarantees):
+## A note on honesty
 
-```bash
-pip install pytest && pytest -q
-```
+This is a scaled reproduction, not a carbon copy of the paper. It uses a small CNN and a couple of the paper's tasks (Yearbook, plus a synthetic drifting-data stream I use for quick checks), so I'm matching the paper's qualitative story rather than its exact numbers. The obvious next step, and the one I'd most like to do, is a language track — the paper's most interesting contrast is that shrinking helps text but not vision, and comparing basin barriers across the two would be a real test of the explanation.
 
-## The extension: per-layer, norm-aware downscaling
-
-The paper downscales the whole model by a single scalar α and argues it works because parameter L2-norm grows over time ("overconfidence"). But norm growth is **not uniform across layers** — some layers barely move while others blow up. Hypothesis: a **per-layer** downscaling factor, still tuned only on past data, should shrink high-growth layers harder and recover gains the global scalar misses — especially on the vision task where global downscaling underperforms.
-
-Implementation (`methods.per_layer_downscale`): measure each layer's relative norm growth over the trajectory, then set `alpha_layer = alpha_base ** (growth_layer / mean_growth)`, tuning a single scalar `alpha_base` on past data. When growth is uniform this reduces exactly to global downscaling (see `tests/test_methods.py`).
-
-`results/fig_layer_growth.png` shows the non-uniform growth that motivates it; `summary_by_method.csv` shows whether it helps. **Report the result honestly — a negative result (per-layer also fails to beat Recent) is a valid, on-brand finding for this paper.**
-
-## Original method: Anisotropic Trajectory Downscaling (ATD)
-
-The paper's downscaling shrinks *all* parameters toward zero (global); the per-layer extension shrinks each layer. Both assume the model's over-confidence in the present is spread evenly. **ATD makes a sharper hypothesis:** the model's recent adaptation to the current timestep lives in a low-dimensional subspace — the directions θ actually moved over the last few checkpoints — so we should shrink θ_t *only along that "recency subspace,"* leaving the stable bulk untouched.
-
-Mechanically (`methods.anisotropic_trajectory_downscale`): take the last *m* parameter-update deltas, extract their top-*k* principal directions by SVD (the recency subspace), project θ_t onto it, and damp only that component by β ∈ [0,1] (tuned past-only):
-
-```
-theta_tilde = theta_t - (1 - beta) * P_recency(theta_t)
-```
-
-β = 1 recovers `recent`; if the subspace were the whole space it would recover global `downscale`. Crucially, ATD is **not** a convex combination of checkpoints — it is a directed subspace rescaling — so it lies *outside* the paper's interpolation/extrapolation family. The hypothesis worth testing: ATD may help on vision (where global downscaling failed) by damping only the present-specific directions. A negative result is still informative — it would say the vision failure isn't about a low-dimensional recency direction at all. Unit tests in `tests/test_methods.py` pin down both limiting cases.
-
-## The diagnostic: are consecutive checkpoints in connected basins?
-
-The paper argues interpolation fails because independently-drifting checkpoints land in disconnected loss basins (non-identifiability). Rather than take that on faith, this repo *measures* it: `trajectory_barriers` interpolates linearly between θ_t and θ_{t+1} (parameters **and** buffers) and reports the **loss barrier** — how high the loss climbs above the straight line joining the two endpoint losses. A near-zero barrier means the basins are connected (interpolation is meaningful); a large barrier means they are not (interpolation must cross high-loss regions, so no amount of averaging will help).
-
-Outputs: `results/basin_barriers.csv`, `fig_loss_path.png` (one representative path), `fig_barriers.png` (barrier per timestep). The console prints the mean barrier. **The payoff question to explore:** does the barrier differ between modalities — low for text, high for vision? If so, it *explains* why downscaling helps text but not vision, going a step beyond the paper. (You'll need one text run to make that comparison; the language track is scaffolded for Colab.)
-
-## Repository layout
-
-```
-run.py                     # entrypoint (--smoke-test / --dataset / --device)
-src/tg/
-  utils.py                 # seeding, device, flat param-vector <-> model
-  model.py                 # SmallCNN for 32x32x1 images
-  data.py                  # synthetic temporal stream + Wilds-Time Yearbook loader
-  methods.py               # recent / average / ema / downscale / taylor / per_layer
-  engine.py                # sequential training, past-only alpha tuning, forward transfer
-  analysis.py              # norm trajectories, per-layer growth, PCA
-  plots.py                 # figure generation
-tests/test_methods.py      # unit tests for the method math
-tools/verify_logic_numpy.py# torch-free logic check of the whole pipeline
-results/                   # generated csv + figures
-```
-
-## Reproduction status & honesty notes
-
-- **Scope.** This is a *scaled* reproduction aimed at the paper's qualitative findings, not bit-exact numbers. It uses a small CNN and a subset of the paper's tasks (Yearbook vision + a self-contained synthetic stream; the T5/NewsRoom language track is scaffolded for Colab).
-- **Verified here.** All modules byte-compile; the algorithm runs end-to-end via a torch-free NumPy mirror (`tools/verify_logic_numpy.py`) which confirms the checkpoint-trajectory build, the past-only α tuning, and the forward-transfer loop. On that smooth synthetic stream, Taylor extrapolation already lands ≤ Recent, echoing the paper.
-- **Run on your hardware.** The PyTorch experiments (`run.py`) are intended to run on an Apple-Silicon Mac (MPS) / Colab; fill in the real numbers there before sharing.
-- **What to claim.** "I reproduced the qualitative finding that no interpolation/extrapolation method reliably beats the recent-model baseline, and I tested a per-layer variant of the one method that does help." Nothing more, nothing less.
-
-## Findings note
-
-See `ONE_PAGER.md` for a short narrative write-up and `FINDINGS.md` for the detailed results note to fill in after your runs — this is the document to send Professor Cho alongside the repo link.
+Everything I concluded is written up plainly in `ONE_PAGER.md` (also as a PDF) and in more detail in `FINDINGS.md`.
 
 ## Citation
 
